@@ -11,28 +11,27 @@ use super::SimpleSerialize;
 
 impl<T: SimpleSerialize> SimpleSerialize for UnsafeVersionedVec<T> {
     fn serialize(&self, bufman: &BufferManager, cursor: u64) -> Result<u32, BufIoError> {
+        // Serialize next node first
         let next = unsafe { &*self.next.get() };
         let next_offset = if let Some(next) = next {
             next.serialize(bufman, cursor)?
         } else {
             u32::MAX
         };
-        let offset_read_guard = self.serialized_at.read().map_err(|_| BufIoError::Locking)?;
-        if let Some(offset) = *offset_read_guard {
-            bufman.seek_with_cursor(cursor, offset.0 as u64)?;
-            bufman.update_u32_with_cursor(cursor, next_offset)?;
-            return Ok(offset.0);
+
+        // Early return if already serialized
+        if let Ok(guard) = self.serialized_at.read() {
+            if let Some(offset) = *guard {
+                // Update next pointer and return
+                bufman.seek_with_cursor(cursor, offset.0 as u64)?;
+                bufman.update_u32_with_cursor(cursor, next_offset)?;
+                return Ok(offset.0);
+            }
         }
-        drop(offset_read_guard);
-        
-        let offset_write_guard = self.serialized_at.write().map_err(|_| BufIoError::Locking)?;
-        if let Some(offset) = *offset_write_guard {
-            bufman.seek_with_cursor(cursor, offset.0 as u64)?;
-            bufman.update_u32_with_cursor(cursor, next_offset)?;
-            return Ok(offset.0);
-        }
+
+        // Prepare serialization buffer
         let list = unsafe { &*self.list.get() };
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(8 + list.len() * 4); // Pre-allocate buffer
 
         // Write version
         buf.extend(self.version.to_le_bytes());
@@ -44,18 +43,20 @@ impl<T: SimpleSerialize> SimpleSerialize for UnsafeVersionedVec<T> {
             buf.extend(serialized_offset.to_le_bytes());
         }
 
-        // Write to file and update serialized_at
+        // Write to file
         let written_bytes = bufman.write_to_end_of_file(cursor, &buf)?;
-        let offset = written_bytes.try_into().map_err(|_| {
+        let offset: u32 = written_bytes.try_into().map_err(|_| {
             BufIoError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "File offset too large"
             ))
         })?;
 
+        // Update serialized_at with minimal lock time
         if let Ok(mut guard) = self.serialized_at.write() {
             *guard = Some(FileOffset(offset));
         }
+
         Ok(offset)
     }
 

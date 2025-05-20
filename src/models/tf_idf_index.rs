@@ -89,6 +89,58 @@ impl<T> UnsafeVersionedVec<T> {
     }
 }
 
+impl<T: Clone> UnsafeVersionedVec<T> {
+    pub fn copy_from(&self, other: &Self) {
+        unsafe {
+            let list = &mut *self.list.get();
+            let other_list = &*other.list.get();
+            list.clear();
+            list.reserve(other_list.len());
+            list.extend_from_slice(other_list);
+            
+            let next = &mut *self.next.get();
+            let other_next = &*other.next.get();
+            *next = other_next.as_ref().map(|n| Box::new((**n).clone()));
+        }
+    }
+    
+    /// Optimized batch push that minimizes cloning
+    pub fn batch_push(&mut self, version: VersionHash, values: &[T]) {
+        if self.version == version {
+            unsafe {
+                let list = &mut *self.list.get();
+                list.reserve(values.len());
+                list.extend_from_slice(values);
+            }
+            return;
+        }
+
+        let next = unsafe { &mut *self.next.get() };
+        match next {
+            Some(next_vec) => next_vec.batch_push(version, values),
+            None => {
+                let mut new_next = Box::new(Self::new(version));
+                new_next.batch_push(version, values);
+                *next = Some(new_next);
+            }
+        }
+    }
+
+    /// Create a new version with optimized insertion
+    pub fn new_version_with(&self, version: VersionHash, values: &[T]) -> Self {
+        let mut new_vec = Self::new(version);
+        unsafe {
+            let list = &mut *new_vec.list.get();
+            list.reserve(values.len());
+            list.extend_from_slice(values);
+            
+            // Link to existing chain
+            *new_vec.next.get() = Some(Box::new(self.clone()));
+        }
+        new_vec
+    }
+}
+
 impl UnsafeVersionedVec<(u32, f32)> {
     pub fn push_sorted(&mut self, version: VersionHash, value: (u32, f32)) {
         if self.version == version {
@@ -373,24 +425,32 @@ impl TFIDFIndexNode {
         data.map.modify_or_insert(
             quotient,
             |term| {
-                // Create new documents vec with updated data
-                let mut new_documents = UnsafeVersionedVec::new(version);
-                // Copy existing documents
-                for (doc_id, doc_value) in unsafe { &*term.documents.list.get() }.iter().cloned() {
-                    new_documents.push(term.documents.version, (doc_id, doc_value));
-                }
-                // Add new document in sorted order
-                new_documents.push_sorted(version, (document_id, value));
+                let new_docs = {
+                    let existing = unsafe { &*term.documents.list.get() };
+                    let mut new_values = Vec::with_capacity(existing.len() + 1);
+                    
+                    // Merge sort the new value with existing values
+                    let mut i = 0;
+                    while i < existing.len() && existing[i].0 < document_id {
+                        new_values.push(existing[i].clone());
+                        i += 1;
+                    }
+                    new_values.push((document_id, value));
+                    new_values.extend_from_slice(&existing[i..]);
+                    
+                    // Create new version with optimized insertion
+                    term.documents.new_version_with(version, &new_values)
+                };
                 
                 // Update the term with new documents
                 *term = Arc::new(TermInfo {
-                    documents: new_documents,
+                    documents: new_docs,
                     sequence_idx: term.sequence_idx,
                 });
             },
             || {
                 // Create new inner map if quotient not found
-                let documents = UnsafeVersionedVec::new(version);
+                let mut documents = UnsafeVersionedVec::new(version);
                 documents.push(version, (document_id, value));
                 let sequence_idx = data.map_len.fetch_add(1, Ordering::Relaxed) as u16;
                 Arc::new(TermInfo {
