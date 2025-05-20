@@ -490,13 +490,75 @@ impl<K, V: SimpleSerialize> TreeMap<K, V> {
     pub fn serialize(&self, file_parts: u8) -> Result<(), BufIoError> {
         let bufman = self.bufmans.get(0)?;
         let cursor = bufman.open_cursor()?;
+        
+        // Reserve space for root offset
         bufman.update_u32_with_cursor(cursor, u32::MAX)?;
-        let offset = self.root.serialize(&self.bufmans, file_parts, 0, 0)?;
+        
+        // Serialize with version tracking
+        let offset = self.root.serialize_with_versions(&self.bufmans, file_parts, 0, 0)?;
+        
+        // Update root offset
         bufman.seek_with_cursor(cursor, 0)?;
         bufman.update_u32_with_cursor(cursor, offset)?;
         bufman.close_cursor(cursor)?;
+        
+        // Ensure all changes are flushed
         self.bufmans.flush_all()?;
         Ok(())
+    }
+
+    fn serialize_with_versions(
+        &self,
+        bufmans: &BufferManagerFactory<u8>,
+        file_parts: u8,
+        file_idx: u8,
+        cursor: u64,
+    ) -> Result<u32, BufIoError> {
+        let file_idx = (self.node_idx % file_parts as u16) as u8;
+        let bufman = bufmans.get(file_idx)?;
+        let cursor = bufman.open_cursor()?;
+
+        // Early return with version chain intact if already serialized
+        if let Ok(guard) = self.offset.read() {
+            if let Some(offset) = *guard {
+                if !self.dirty.load(Ordering::Relaxed) {
+                    return Ok(offset.0);
+                }
+            }
+        }
+
+        // Pre-allocate buffer for efficiency
+        let mut buf = Vec::with_capacity(34 + self.children.items.len() * 4);
+        buf.extend(self.node_idx.to_le_bytes());
+
+        // Serialize children with version preservation
+        for child in &self.children.items {
+            let opt_child = unsafe { child.load(Ordering::Relaxed).as_ref() };
+            match opt_child {
+                Some(child) => {
+                    let offset = child.serialize_with_versions(bufmans, file_parts, file_idx, cursor)?;
+                    buf.extend(offset.to_le_bytes());
+                }
+                None => buf.extend(u32::MAX.to_le_bytes()),
+            }
+        }
+
+        // Serialize quotients map with version info
+        let quotients_offset = self.quotients.serialize_with_version(&bufman, cursor)?;
+        buf.extend(quotients_offset.to_le_bytes());
+
+        // Write buffer with minimal lock contention
+        let start = bufman.write_to_end_of_file(cursor, &buf)? as u32;
+        
+        // Update offset with proper synchronization
+        if let Ok(mut guard) = self.offset.write() {
+            *guard = Some(FileOffset(start));
+        }
+        
+        self.dirty.store(false, Ordering::Release);
+        bufman.close_cursor(cursor)?;
+        
+        Ok(start)
     }
 
     pub fn deserialize(

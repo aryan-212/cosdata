@@ -12,6 +12,94 @@ use crate::models::{
     types::FileOffset,
 };
 
+impl TFIDFIndexNodeData {
+    pub fn batch_insert(
+        &self,
+        version: VersionHash,
+        entries: Vec<(TermQuotient, (f32, u32))>,
+    ) -> Result<(), BufIoError> {
+        // Sort entries by quotient for efficient insertion
+        let mut sorted_entries = entries;
+        sorted_entries.sort_by_key(|(q, _)| *q);
+
+        // Group by quotient for batch updates
+        let mut current_quotient = None;
+        let mut current_batch = Vec::new();
+
+        for (quotient, value) in sorted_entries {
+            match current_quotient {
+                Some(q) if q == quotient => {
+                    current_batch.push(value);
+                }
+                _ => {
+                    // Process previous batch if any
+                    if let Some(q) = current_quotient {
+                        if let Some(term_info) = self.terms.get(&q) {
+                            term_info.batch_push(version, &current_batch);
+                        }
+                    }
+                    // Start new batch
+                    current_quotient = Some(quotient);
+                    current_batch.clear();
+                    current_batch.push(value);
+                }
+            }
+        }
+
+        // Process final batch
+        if let Some(quotient) = current_quotient {
+            if let Some(term_info) = self.terms.get(&quotient) {
+                term_info.batch_push(version, &current_batch);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn serialize(
+        &self,
+        dim_bufman: &BufferManager,
+        data_bufmans: &BufferManagerFactory<u8>,
+        offset_counter: &AtomicU32,
+        file_idx: u8,
+        file_parts: u8,
+        cursor: u64,
+    ) -> Result<u32, BufIoError> {
+        // Start with header
+        let mut header_buf = Vec::with_capacity(16);
+        header_buf.extend(TF_IDF_INDEX_DATA_CHUNK_SIZE.to_le_bytes());
+        
+        let start = offset_counter.fetch_add(header_buf.len() as u32, Ordering::AcqRel);
+        dim_bufman.write_to_end_of_file(cursor, &header_buf)?;
+
+        // Sort terms for deterministic serialization
+        let mut term_entries: Vec<_> = self.terms.iter().collect();
+        term_entries.sort_by_key(|(k, _)| *k);
+
+        // Batch serialize terms with optimized buffer usage
+        for chunk in term_entries.chunks(TF_IDF_INDEX_DATA_CHUNK_SIZE as usize) {
+            let mut chunk_buf = Vec::with_capacity(chunk.len() * 16);
+            
+            for (quotient, term_info) in chunk {
+                chunk_buf.extend(quotient.to_le_bytes());
+                let term_offset = term_info.serialize(
+                    dim_bufman,
+                    data_bufmans, 
+                    offset_counter,
+                    file_idx,
+                    file_parts,
+                    cursor,
+                )?;
+                chunk_buf.extend(term_offset.to_le_bytes());
+            }
+
+            dim_bufman.write_to_end_of_file(cursor, &chunk_buf)?;
+        }
+
+        Ok(start)
+    }
+}
+
 impl TFIDFIndexSerialize for TFIDFIndexNodeData {
     fn serialize(
         &self,
