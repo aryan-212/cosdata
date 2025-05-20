@@ -90,25 +90,26 @@ impl<T> UnsafeVersionedVec<T> {
 }
 
 impl UnsafeVersionedVec<(u32, f32)> {
-    pub fn push_sorted(&self, version: VersionHash, value: (u32, f32)) {
+    pub fn push_sorted(&mut self, version: VersionHash, value: (u32, f32)) {
         if self.version == version {
+            // If adding to current version, just insert sorted
             let list = unsafe { &mut *self.list.get() };
             let mut i = list.len();
             while i > 0 && list[i - 1].0 > value.0 {
                 i -= 1;
             }
             list.insert(i, value);
-            return;
-        }
-
-        let next = unsafe { &mut *self.next.get() };
-
-        if let Some(next) = next {
-            next.push_sorted(version, value);
         } else {
-            let new_next = Box::new(Self::new(version));
-            new_next.push_sorted(version, value);
-            *next = Some(new_next);
+            // Otherwise, find or create the appropriate version node
+            let next = unsafe { &mut *self.next.get() };
+            match next {
+                Some(next_vec) => next_vec.push_sorted(version, value),
+                None => {
+                    let mut new_vec = Box::new(Self::new(version));
+                    new_vec.push_sorted(version, value);
+                    *next = Some(new_vec);
+                }
+            }
         }
     }
 }
@@ -128,6 +129,17 @@ impl<T: Debug> Debug for UnsafeVersionedVec<T> {
             .field("list", unsafe { &*self.list.get() })
             .field("next", unsafe { &*self.next.get() })
             .finish()
+    }
+}
+
+impl<T: Clone> Clone for UnsafeVersionedVec<T> {
+    fn clone(&self) -> Self {
+        Self {
+            serialized_at: RwLock::new(*self.serialized_at.read().unwrap()),
+            version: self.version,
+            list: UnsafeCell::new(unsafe { &*self.list.get() }.clone()),
+            next: UnsafeCell::new(unsafe { &*self.next.get() }.clone()),
+        }
     }
 }
 
@@ -356,17 +368,31 @@ impl TFIDFIndexNode {
     ) -> Result<(), BufIoError> {
         // Get node data
         let data = unsafe { &*self.data }.try_get_data(cache, self.dim_index)?;
+        
         // Get or create inner map for this quotient
         data.map.modify_or_insert(
             quotient,
             |term| {
-                term.documents.push_sorted(version, (document_id, value));
+                // Create new documents vec with updated data
+                let mut new_documents = UnsafeVersionedVec::new(version);
+                // Copy existing documents
+                for (doc_id, doc_value) in unsafe { &*term.documents.list.get() }.iter().cloned() {
+                    new_documents.push(term.documents.version, (doc_id, doc_value));
+                }
+                // Add new document in sorted order
+                new_documents.push_sorted(version, (document_id, value));
+                
+                // Update the term with new documents
+                *term = Arc::new(TermInfo {
+                    documents: new_documents,
+                    sequence_idx: term.sequence_idx,
+                });
             },
             || {
                 // Create new inner map if quotient not found
                 let documents = UnsafeVersionedVec::new(version);
-                let sequence_idx = data.map_len.fetch_add(1, Ordering::Relaxed);
                 documents.push(version, (document_id, value));
+                let sequence_idx = data.map_len.fetch_add(1, Ordering::Relaxed) as u16;
                 Arc::new(TermInfo {
                     documents,
                     sequence_idx,

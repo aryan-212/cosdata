@@ -24,56 +24,61 @@ impl<T: SimpleSerialize> SimpleSerialize for UnsafeVersionedVec<T> {
             return Ok(offset.0);
         }
         drop(offset_read_guard);
-        let mut offset_write_guard = self
-            .serialized_at
-            .write()
-            .map_err(|_| BufIoError::Locking)?;
+        
+        let offset_write_guard = self.serialized_at.write().map_err(|_| BufIoError::Locking)?;
         if let Some(offset) = *offset_write_guard {
             bufman.seek_with_cursor(cursor, offset.0 as u64)?;
             bufman.update_u32_with_cursor(cursor, next_offset)?;
             return Ok(offset.0);
         }
         let list = unsafe { &*self.list.get() };
-        let size = 4 * list.len() + 16;
-        let mut buf = Vec::with_capacity(size);
-        buf.extend(next_offset.to_le_bytes());
-        buf.extend(self.version.to_le_bytes());
-        buf.extend((list.len() as u32).to_le_bytes());
+        let mut buf = Vec::new();
 
-        for el in list {
-            let serialized_offset = el.serialize(bufman, cursor)?;
+        // Write version
+        buf.extend(self.version.to_le_bytes());
+
+        // Write list length and contents
+        buf.extend((list.len() as u32).to_le_bytes());
+        for item in list {
+            let serialized_offset = item.serialize(bufman, cursor)?;
             buf.extend(serialized_offset.to_le_bytes());
         }
 
-        let offset = bufman.write_to_end_of_file(cursor, &buf)? as u32;
-        *offset_write_guard = Some(FileOffset(offset));
+        // Write to file and update serialized_at
+        let written_bytes = bufman.write_to_end_of_file(cursor, &buf)?;
+        let offset = written_bytes.try_into().map_err(|_| {
+            BufIoError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "File offset too large"
+            ))
+        })?;
 
+        if let Ok(mut guard) = self.serialized_at.write() {
+            *guard = Some(FileOffset(offset));
+        }
         Ok(offset)
     }
 
     fn deserialize(bufman: &BufferManager, offset: FileOffset) -> Result<Self, BufIoError> {
         let cursor = bufman.open_cursor()?;
         bufman.seek_with_cursor(cursor, offset.0 as u64)?;
-        let next_offset = bufman.read_u32_with_cursor(cursor)?;
+
+        // Read version
         let version = VersionHash::from(bufman.read_u64_with_cursor(cursor)?);
+
+        // Read list length and contents
         let len = bufman.read_u32_with_cursor(cursor)? as usize;
         let mut list = Vec::with_capacity(len);
-
         for _ in 0..len {
             let el_offset = bufman.read_u32_with_cursor(cursor)?;
             let el = T::deserialize(bufman, FileOffset(el_offset))?;
             list.push(el);
         }
 
-        let next = if next_offset == u32::MAX {
-            None
-        } else {
-            Some(Box::new(Self::deserialize(
-                bufman,
-                FileOffset(next_offset),
-            )?))
-        };
-
+        // Create UnsafeVersionedVec with loaded data
+        let next = None; // Next pointer will be handled elsewhere if needed
+        bufman.close_cursor(cursor)?;
+        
         Ok(Self {
             serialized_at: RwLock::new(Some(offset)),
             version,
