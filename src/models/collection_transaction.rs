@@ -15,7 +15,7 @@ pub struct BackgroundCollectionTransaction {
 
 impl BackgroundCollectionTransaction {
     pub fn new(collection: &Collection) -> Result<Self, WaCustomError> {
-        let current_version_number = retrieve_current_version(&collection.lmdb)?;
+        let current_version_number = retrieve_current_version(&collection.meta_store)?;
         let version_number = VersionNumber::from(*current_version_number + 1);
 
         Ok(Self::from_version_id_and_number(collection, version_number))

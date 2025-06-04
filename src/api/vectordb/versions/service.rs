@@ -15,15 +15,18 @@ pub(crate) async fn list_versions(
     ctx: Arc<AppContext>,
     collection_id: &str,
 ) -> Result<VersionListResponse, VersionError> {
-    let env = ctx.ain_env.persist.clone();
-    let lmdb = MetaDb::from_env(env.clone(), collection_id)
-        .map_err(|e| WaCustomError::DatabaseError(e.to_string()))?;
-    let version_control = VersionControl::from_existing(env.clone(), lmdb.db);
+    // Get the collection from the in-memory map
+    let collection = ctx
+        .ain_env
+        .collections_map
+        .get_collection(collection_id)
+        .ok_or(VersionError::CollectionNotFound)?;
+    let version_control = &collection.vcs;
     let versions = version_control
         .get_versions()
         .map_err(|e| WaCustomError::DatabaseError(e.to_string()))?;
     let current_version =
-        retrieve_current_version(&lmdb).map_err(|e| VersionError::DatabaseError(e.to_string()))?;
+        retrieve_current_version(&collection.meta_store).map_err(|e| VersionError::DatabaseError(e.to_string()))?;
     let versions = versions
         .into_iter()
         .map(|meta| VersionMetadata {
@@ -41,11 +44,14 @@ pub(crate) async fn get_current_version(
     ctx: Arc<AppContext>,
     collection_id: &str,
 ) -> Result<CurrentVersionResponse, VersionError> {
-    let env = ctx.ain_env.persist.clone();
-    let lmdb = MetaDb::from_env(env.clone(), collection_id)
-        .map_err(|e| WaCustomError::DatabaseError(e.to_string()))?;
-    let version_control = VersionControl::from_existing(env.clone(), lmdb.db);
-    let version_number = version_control
+    // Get the collection from the in-memory map
+    let collection = ctx
+        .ain_env
+        .collections_map
+        .get_collection(collection_id)
+        .ok_or(VersionError::CollectionNotFound)?;
+    let version_number = collection
+        .vcs
         .get_current_version()
         .map_err(|e| VersionError::DatabaseError(e.to_string()))?;
 

@@ -578,6 +578,26 @@ impl TreeMapKey for u64 {
     }
 }
 
+impl TreeMapKey for String {
+    fn key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        use siphasher::sip::SipHasher24;
+        let mut hasher = SipHasher24::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+impl TreeMapKey for &str {
+    fn key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        use siphasher::sip::SipHasher24;
+        let mut hasher = SipHasher24::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;

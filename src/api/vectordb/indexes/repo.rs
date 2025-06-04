@@ -209,15 +209,7 @@ pub(crate) async fn delete_index(
                     collection_name
                 )));
             }
-            ctx.ain_env
-                .collections_map
-                .remove_hnsw_index(&collection_name)
-                .map_err(|e| {
-                    IndexesError::FailedToDeleteIndex(format!(
-                        "Failed to remove dense index from map: {}",
-                        e
-                    ))
-                })?;
+            // ctx.ain_env.collections_map.remove_hnsw_index(&collection_name)?;
 
             let index_path = collection_path.join("dense_hnsw");
             if index_path.exists() {
@@ -254,15 +246,7 @@ pub(crate) async fn delete_index(
                     collection_name
                 )));
             }
-            ctx.ain_env
-                .collections_map
-                .remove_inverted_index(&collection_name)
-                .map_err(|e| {
-                    IndexesError::FailedToDeleteIndex(format!(
-                        "Failed to remove sparse index from map: {}",
-                        e
-                    ))
-                })?;
+            // ctx.ain_env.collections_map.remove_inverted_index(&collection_name)?;
 
             let index_path = collection_path.join("sparse_inverted_index");
             if index_path.exists() {
@@ -299,15 +283,7 @@ pub(crate) async fn delete_index(
                     collection_name
                 )));
             }
-            ctx.ain_env
-                .collections_map
-                .remove_tf_idf_index(&collection_name)
-                .map_err(|e| {
-                    IndexesError::FailedToDeleteIndex(format!(
-                        "Failed to remove TF-IDF index from map: {}",
-                        e
-                    ))
-                })?;
+            // ctx.ain_env.collections_map.remove_tf_idf_index(&collection_name)?;
 
             let index_path = collection_path.join("tf_idf_index");
             if index_path.exists() {

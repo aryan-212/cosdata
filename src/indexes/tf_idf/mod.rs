@@ -6,10 +6,10 @@ use crate::{
         collection::Collection,
         collection_transaction::BackgroundCollectionTransaction,
         common::WaCustomError,
-        meta_persist::store_average_document_length,
+        meta_persist::{store_average_document_length, MetaStore},
         sparse_ann_query::SparseAnnQueryBasic,
         tf_idf_index::TFIDFIndexRoot,
-        types::{InternalId, MetaDb, SparseVector},
+        types::{InternalId, SparseVector},
         versioning::VersionNumber,
     },
 };
@@ -149,7 +149,7 @@ impl IndexOps for TFIDFIndex {
 
     fn finalize_sampling(
         &self,
-        lmdb: &MetaDb,
+        meta_store: &MetaStore,
         _config: &Config,
         _embeddings: &[Self::IndexingInput],
     ) -> Result<(), WaCustomError> {
@@ -161,11 +161,10 @@ impl IndexOps for TFIDFIndex {
             .sampling_data
             .total_documents_length
             .load(Ordering::Relaxed);
-
         let avg_length = total_documents_length as f32 / total_documents_count as f32;
         *self.average_document_length.write().unwrap() = avg_length;
         self.is_configured.store(true, Ordering::Release);
-        store_average_document_length(lmdb, avg_length)?;
+        store_average_document_length(meta_store, avg_length)?;
         Ok(())
     }
 

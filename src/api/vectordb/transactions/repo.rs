@@ -73,7 +73,7 @@ pub(crate) async fn commit_transaction(
         .vcs
         .set_current_version(current_transaction_id, false)
         .map_err(|err| TransactionError::FailedToCommitTransaction(err.to_string()))?;
-    update_current_version(&collection.lmdb, current_transaction_id)
+    update_current_version(&collection.meta_store, current_transaction_id)
         .map_err(|err| TransactionError::FailedToCommitTransaction(err.to_string()))?;
 
     collection.trigger_indexing(current_transaction_id);

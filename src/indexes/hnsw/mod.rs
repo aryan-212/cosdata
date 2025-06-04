@@ -13,9 +13,9 @@ use crate::{
         collection::Collection,
         collection_transaction::BackgroundCollectionTransaction,
         common::WaCustomError,
-        meta_persist::store_values_range,
+        meta_persist::{store_values_range, MetaStore},
         prob_node::SharedLatestNode,
-        types::{DistanceMetric, FileOffset, HNSWLevel, InternalId, MetaDb, QuantizationMetric},
+        types::{DistanceMetric, FileOffset, HNSWLevel, InternalId, QuantizationMetric},
     },
     quantization::{Quantization, StorageType},
     vector_store::{ann_search, finalize_ann_results, index_embeddings},
@@ -212,7 +212,7 @@ impl IndexOps for HNSWIndex {
 
     fn finalize_sampling(
         &self,
-        lmdb: &MetaDb,
+        meta_store: &MetaStore,
         config: &Config,
         embeddings: &[Self::IndexingInput],
     ) -> Result<(), WaCustomError> {
@@ -275,7 +275,7 @@ impl IndexOps for HNSWIndex {
         let range = (range_start, range_end);
         *self.values_range.write().unwrap() = range;
         self.is_configured.store(true, Ordering::Release);
-        store_values_range(lmdb, range)?;
+        store_values_range(meta_store, range)?;
         Ok(())
     }
 

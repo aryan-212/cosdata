@@ -1,13 +1,12 @@
 use std::sync::Arc;
+use std::path::Path;
 
 use crate::{
     app_context::AppContext,
     models::{
         collection::{Collection, CollectionIndexingStatus},
         common::WaCustomError,
-        meta_persist::update_current_version,
-        types::MetaDb,
-        versioning::VersionControl,
+        tree_map::TreeMap,
     },
 };
 
@@ -18,6 +17,9 @@ use super::{
     },
     error::CollectionsError,
 };
+
+use crate::models::buffered_io::BufferManagerFactory;
+use crate::models::versioning::VersionNumber;
 
 pub(crate) async fn create_collection(
     ctx: Arc<AppContext>,
@@ -37,12 +39,19 @@ pub(crate) async fn create_collection(
         return Err(CollectionsError::AlreadyExists(name));
     }
 
-    let env = &ctx.ain_env.persist;
-    let collections_db = &ctx.ain_env.collections_map.lmdb_collections_db;
-    let lmdb = MetaDb::from_env(env.clone(), &name)
-        .map_err(|err| CollectionsError::WaCustomError(WaCustomError::from(err)))?;
-    let (vcs, hash) = VersionControl::new(env.clone(), lmdb.db)
-        .map_err(|err| CollectionsError::WaCustomError(WaCustomError::from(err)))?;
+    // Construct the BufferManagerFactory for MetaStore
+    let collections_path: Arc<Path> = crate::models::paths::get_data_path().join("collections").join(&name).into();
+    let meta_store_bufmans = BufferManagerFactory::new(
+        collections_path.clone(),
+        |root, part| root.join(format!("{}.meta", part)),
+        8192,
+    );
+    let meta_store = Arc::new(TreeMap::new(meta_store_bufmans));
+
+    // VersionControl and hash logic may need to be updated to not use LMDB
+    // For now, pass dummy values or refactor as needed
+    let vcs = panic!("VersionControl construction for Treemap-based collections is not yet implemented");
+    let hash = VersionNumber::from(0); // Placeholder, update as needed
 
     let metadata_schema = match metadata_schema {
         Some(s) => {
@@ -63,7 +72,7 @@ pub(crate) async fn create_collection(
         metadata_schema,
         config,
         store_raw_text,
-        lmdb,
+        meta_store,
         hash,
         vcs,
         &ctx,
@@ -76,15 +85,11 @@ pub(crate) async fn create_collection(
         .insert_collection(collection.clone())
         .map_err(CollectionsError::WaCustomError)?;
 
-    // persisting collection after creation
-    collection
-        .persist(env, *collections_db)
-        .map_err(CollectionsError::WaCustomError)?;
-
+    // Remove LMDB-specific persistence and update_current_version
     collection
         .flush(&ctx.config)
         .map_err(CollectionsError::WaCustomError)?;
-    update_current_version(&collection.lmdb, hash).map_err(CollectionsError::WaCustomError)?;
+    // update_current_version(&collection.meta_store, hash).map_err(CollectionsError::WaCustomError)?;
     Ok(collection)
 }
 
@@ -142,17 +147,9 @@ pub(crate) async fn delete_collection_by_name(
     ctx: Arc<AppContext>,
     name: &str,
 ) -> Result<Arc<Collection>, CollectionsError> {
-    let env = &ctx.ain_env.persist;
-    let collections_db = &ctx.ain_env.collections_map.lmdb_collections_db;
-
     let collection = get_collection_by_name(ctx.clone(), name).await?;
 
-    // deleting collection from disk
-    collection
-        .delete(env, *collections_db)
-        .map_err(CollectionsError::WaCustomError)?;
-
-    // deleting collection from in-memory map
+    // Remove collection from in-memory map
     let collection = ctx
         .ain_env
         .collections_map

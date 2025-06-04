@@ -4,10 +4,10 @@ use super::collection_transaction::{
 };
 use super::common::WaCustomError;
 use super::indexing_manager::IndexingManager;
-use super::meta_persist::store_highest_internal_id;
+use super::meta_persist::{store_highest_internal_id, MetaStore};
 use super::paths::get_data_path;
 use super::tree_map::{TreeMap, TreeMapVec};
-use super::types::{get_collections_path, DocumentId, InternalId, MetaDb, VectorId};
+use super::types::{get_collections_path, DocumentId, InternalId, VectorId};
 use super::versioning::{VersionControl, VersionNumber};
 use super::wal::VectorOp;
 use crate::app_context::AppContext;
@@ -19,7 +19,6 @@ use crate::indexes::tf_idf::{TFIDFIndex, TFIDFInputEmbedding};
 use crate::indexes::IndexOps;
 use crate::metadata::{MetadataFields, MetadataSchema};
 use chrono::{DateTime, TimeZone, Utc};
-use lmdb::{Database, Environment, Transaction, WriteFlags};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_cbor::to_vec;
@@ -100,7 +99,7 @@ pub struct CollectionIndexingStatus {
 
 pub struct Collection {
     pub meta: CollectionMetadata,
-    pub lmdb: MetaDb,
+    pub meta_store: MetaStore,
     pub current_version: RwLock<VersionNumber>,
     pub current_open_transaction: RwLock<Option<CollectionTransaction>>,
     pub vcs: VersionControl,
@@ -112,10 +111,6 @@ pub struct Collection {
     pub hnsw_index: RwLock<Option<Arc<HNSWIndex>>>,
     pub inverted_index: RwLock<Option<Arc<InvertedIndex>>>,
     pub tf_idf_index: RwLock<Option<Arc<TFIDFIndex>>>,
-    // this field is actually NOT optional, the only reason it is wrapped in
-    // `Option` is to allow us to create `Collection` first without the
-    // indexing manager, because `IndexingManager`'s constructor also requires
-    // a reference to the collection
     pub indexing_manager: RwLock<Option<IndexingManager>>,
 }
 
@@ -130,7 +125,7 @@ impl Collection {
         metadata_schema: Option<MetadataSchema>,
         collection_config: CollectionConfig,
         store_raw_text: bool,
-        lmdb: MetaDb,
+        meta_store: MetaStore,
         current_version: VersionNumber,
         vcs: VersionControl,
         ctx: &AppContext,
@@ -176,7 +171,7 @@ impl Collection {
                 config: collection_config,
                 store_raw_text,
             },
-            lmdb,
+            meta_store,
             current_version: RwLock::new(current_version),
             current_open_transaction: RwLock::new(None),
             vcs,
@@ -226,40 +221,6 @@ impl Collection {
     /// serializes the collection
     pub fn serialize(&self) -> Result<Vec<u8>, WaCustomError> {
         to_vec(&self.meta).map_err(|e| WaCustomError::SerializationError(e.to_string()))
-    }
-
-    /// perists the collection instance on disk (lmdb -> collections database)
-    pub fn persist(&self, env: &Environment, db: Database) -> Result<(), WaCustomError> {
-        let key = self.get_key();
-        let value = self.serialize()?;
-
-        let mut txn = env
-            .begin_rw_txn()
-            .map_err(|e| WaCustomError::DatabaseError(e.to_string()))?;
-
-        txn.put(db, &key, &value, WriteFlags::empty())
-            .map_err(|e| WaCustomError::DatabaseError(e.to_string()))?;
-        txn.commit()
-            .map_err(|e| WaCustomError::DatabaseError(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// deletes a collection instance from the disk (lmdb -> collections database)
-    #[allow(dead_code)]
-    pub fn delete(&self, env: &Environment, db: Database) -> Result<(), WaCustomError> {
-        let key = self.get_key();
-
-        let mut txn = env
-            .begin_rw_txn()
-            .map_err(|e| WaCustomError::DatabaseError(e.to_string()))?;
-
-        txn.del(db, &key, None)
-            .map_err(|e| WaCustomError::DatabaseError(e.to_string()))?;
-        txn.commit()
-            .map_err(|e| WaCustomError::DatabaseError(e.to_string()))?;
-
-        Ok(())
     }
 
     pub fn get_hnsw_index(&self) -> Option<Arc<HNSWIndex>> {
@@ -427,7 +388,7 @@ impl Collection {
             .serialize(config.tree_map_serialized_parts)?;
         self.transaction_status_map
             .serialize(config.tree_map_serialized_parts)?;
-        store_highest_internal_id(&self.lmdb, self.internal_id_counter.load(Ordering::Relaxed))?;
+        store_highest_internal_id(&self.meta_store, self.internal_id_counter.load(Ordering::Relaxed))?;
         Ok(())
     }
 

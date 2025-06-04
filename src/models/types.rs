@@ -1,24 +1,23 @@
 use super::{
     buffered_io::{BufIoError, BufferManagerFactory},
     cache_loader::HNSWIndexCache,
-    collection::{Collection, CollectionMetadata},
+    collection::{Collection, CollectionMetadata, DenseVectorOptions, SparseVectorOptions, TFIDFOptions, CollectionConfig},
     crypto::{DoubleSHA256Hash, SingleSHA256Hash},
     indexing_manager::IndexingManager,
     inverted_index::InvertedIndexRoot,
     meta_persist::{
-        lmdb_init_collections_db, lmdb_init_db, load_collections, retrieve_average_document_length,
-        retrieve_background_version, retrieve_current_version, retrieve_highest_internal_id,
-        retrieve_values_upper_bound,
+        retrieve_average_document_length, retrieve_background_version, retrieve_current_version,
+        retrieve_highest_internal_id, retrieve_values_upper_bound,
     },
     paths::get_data_path,
     prob_node::ProbNode,
     tf_idf_index::TFIDFIndexRoot,
     tree_map::{TreeMap, TreeMapKey, TreeMapVec},
-    versioning::VersionControl,
+    versioning::{VersionControl, VersionNumber},
 };
 use crate::{
     args::CosdataArgs,
-    config_loader::Config,
+    config_loader::{Config, Server, Host, Port, Ssl, ServerMode, Hnsw, Indexing, VectorsIndexingMode, Search, CacheConfig},
     distance::{
         cosine::{CosineDistance, CosineSimilarity},
         dotproduct::DotProductDistance,
@@ -49,6 +48,7 @@ use crate::{
         StorageType,
     },
     storage::Storage,
+    app_context::AppContext,
 };
 use crossbeam::channel;
 use dashmap::DashMap;
@@ -72,6 +72,10 @@ use std::{
     thread,
     time::Instant,
 };
+use super::meta_persist::MetaStore;
+use bincode;
+use log::warn;
+use super::collection_cache::CollectionCacheManager;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct HNSWLevel(pub u8);
@@ -502,646 +506,149 @@ impl MetaDb {
 
 pub struct CollectionsMap {
     inner_collections: DashMap<String, Arc<Collection>>,
-    lmdb_env: Arc<Environment>,
-    // made it public temporarily
-    // just to be able to persist collections from outside CollectionsMap
-    pub(crate) lmdb_collections_db: Database,
-    lmdb_hnsw_index_db: Database,
-    lmdb_inverted_index_db: Database,
-    lmdb_tf_idf_index_db: Database,
 }
 
 impl CollectionsMap {
-    fn new(env: Arc<Environment>) -> lmdb::Result<Self> {
-        let collections_db = lmdb_init_collections_db(&env)?;
-        let hnsw_index_db = lmdb_init_db(&env, "hnsw_indexes")?;
-        let inverted_index_db = lmdb_init_db(&env, "inverted_indexes")?;
-        let tf_idf_index_db = lmdb_init_db(&env, "tf_idf_indexes")?;
-        let res = Self {
+    pub fn new() -> Self {
+        Self {
             inner_collections: DashMap::new(),
-            lmdb_env: env,
-            lmdb_collections_db: collections_db,
-            lmdb_hnsw_index_db: hnsw_index_db,
-            lmdb_inverted_index_db: inverted_index_db,
-            lmdb_tf_idf_index_db: tf_idf_index_db,
-        };
-        Ok(res)
+        }
     }
 
-    /// Loads collections map from lmdb
-    fn load(
-        env: Arc<Environment>,
-        config: Arc<Config>,
-        threadpool: Arc<ThreadPool>,
-    ) -> Result<Self, WaCustomError> {
-        let collections_map =
-            Self::new(env.clone()).map_err(|e| WaCustomError::DatabaseError(e.to_string()))?;
-
-        let collections = load_collections(
-            &collections_map.lmdb_env,
-            collections_map.lmdb_collections_db,
-        )
-        .map_err(|e| WaCustomError::DatabaseError(e.to_string()))?;
-
-        for collection_meta in collections {
-            let lmdb = MetaDb::from_env(collections_map.lmdb_env.clone(), &collection_meta.name)?;
-            let current_version = retrieve_current_version(&lmdb)?;
-            let vcs = VersionControl::from_existing(lmdb.env.clone(), lmdb.db);
-
-            // if collection has dense index load it from the lmdb
-            let hnsw_index = if collection_meta.dense_vector.enabled {
-                collections_map
-                    .load_hnsw_index(
-                        &collection_meta,
-                        &lmdb,
-                        &config,
-                        collection_meta
-                            .metadata_schema
-                            .as_ref()
-                            .map_or(1, |schema| schema.max_num_replicas()),
-                    )
-                    .unwrap()
-                    .map(Arc::new)
-            } else {
-                None
-            };
-
-            // if collection has inverted index load it from the lmdb
-            let inverted_index = if collection_meta.sparse_vector.enabled {
-                collections_map
-                    .load_inverted_index(&collection_meta, &lmdb, &config)?
-                    .map(Arc::new)
-            } else {
-                None
-            };
-
-            let tf_idf_index = if collection_meta.tf_idf_options.enabled {
-                collections_map
-                    .load_tf_idf_index(&collection_meta, &lmdb, &config)?
-                    .map(Arc::new)
-            } else {
-                None
-            };
-
-            let collections_path: Arc<Path> =
-                get_collections_path().join(&collection_meta.name).into();
-
-            let internal_to_external_map_bufmans = BufferManagerFactory::new(
-                collections_path.clone(),
-                |root, part| root.join(format!("{}.itoe", part)),
+    /// Loads collections map from the collections directory using Treemap-based MetaStore
+    pub fn load_from_disk(config: Arc<Config>, threadpool: Arc<ThreadPool>) -> Result<Self, WaCustomError> {
+        let collections_path = get_collections_path();
+        let mut map = Self::new();
+        if collections_path.exists() {
+            for entry in fs::read_dir(&collections_path).map_err(|e| WaCustomError::FsError(e.to_string()))? {
+                let entry = entry.map_err(|e| WaCustomError::FsError(e.to_string()))?;
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().unwrap().to_string_lossy().to_string();
+                    let meta_store_bufmans = BufferManagerFactory::new(
+                        path.clone().into(),
+                        |root, part| root.join(format!("{}.meta", part)),
                 8192,
             );
-
-            let external_to_internal_map_bufmans = BufferManagerFactory::new(
-                collections_path.clone(),
-                |root, part| root.join(format!("{}.etoi", part)),
-                8192,
-            );
-
-            let document_to_internals_map_bufmans = BufferManagerFactory::new(
-                collections_path.clone(),
-                |root, part| root.join(format!("{}.dtoi", part)),
-                8192,
-            );
-
-            let transaction_status_map_bufmans = BufferManagerFactory::new(
-                collections_path.clone(),
-                |root, part| root.join(format!("{}.txn_status", part)),
-                8192,
-            );
-
-            let id_counter_value = retrieve_highest_internal_id(&lmdb)?.unwrap_or_default();
-
-            let collection = Arc::new(Collection {
-                meta: collection_meta,
-                lmdb,
-                current_version: parking_lot::RwLock::new(current_version),
-                current_open_transaction: parking_lot::RwLock::new(None),
-                vcs,
-                internal_to_external_map: TreeMap::deserialize(
-                    internal_to_external_map_bufmans,
-                    config.tree_map_serialized_parts,
-                )?,
-                external_to_internal_map: TreeMap::deserialize(
-                    external_to_internal_map_bufmans,
-                    config.tree_map_serialized_parts,
-                )?,
-                document_to_internals_map: TreeMapVec::deserialize(
-                    document_to_internals_map_bufmans,
-                    config.tree_map_serialized_parts,
-                )?,
-                transaction_status_map: TreeMap::deserialize(
-                    transaction_status_map_bufmans,
-                    config.tree_map_serialized_parts,
-                )?,
-                internal_id_counter: AtomicU32::new(id_counter_value),
-                hnsw_index: parking_lot::RwLock::new(hnsw_index),
-                inverted_index: parking_lot::RwLock::new(inverted_index),
-                tf_idf_index: parking_lot::RwLock::new(tf_idf_index),
-                indexing_manager: parking_lot::RwLock::new(None),
-            });
-
-            *collection.indexing_manager.write() = Some(IndexingManager::new(
-                collection.clone(),
-                config.clone(),
-                threadpool.clone(),
-            ));
-
-            let background_version = retrieve_background_version(&collection.lmdb)?;
-
-            if background_version != current_version {
-                let all_versions = collection.vcs.get_versions()?;
-                let mut index = false;
-                for version_info in all_versions {
-                    if version_info.version == background_version {
-                        index = true;
-                    }
-                    if index {
-                        collection.trigger_indexing(version_info.version);
-                    }
-                }
-            }
-
-            collections_map
-                .inner_collections
-                .insert(collection.meta.name.clone(), collection);
-        }
-        Ok(collections_map)
-    }
-
-    /// loads and initiates the dense index of a collection from lmdb
-    ///
-    /// In doing so, the root vec for all collections' dense indexes are loaded into
-    /// memory, which also ends up warming the cache (NodeRegistry)
-    fn load_hnsw_index(
-        &self,
-        collection_meta: &CollectionMetadata,
-        lmdb: &MetaDb,
-        config: &Config,
-        max_replicas_per_node: u8,
-    ) -> Result<Option<HNSWIndex>, WaCustomError> {
-        let collection_path: Arc<Path> = get_collections_path().join(&collection_meta.name).into();
-        let index_path = collection_path.join("dense_hnsw");
-
-        // Check if the path exists before proceeding
-        if !index_path.exists() {
-            return Ok(None);
-        }
-
-        let Some(hnsw_index_data) = HNSWIndex::load_data(
-            &self.lmdb_env,
-            self.lmdb_hnsw_index_db,
-            &collection_meta.name,
-        )?
-        else {
-            return Ok(None);
-        };
-        let prop_file_path = index_path.join("prop.data");
-        let prop_file_result = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&prop_file_path);
-
-        let prop_file = match prop_file_result {
-            Ok(file) => RwLock::new(file),
+                    let meta_store = Arc::new(TreeMap::<String, Vec<u8>>::new(meta_store_bufmans));
+                    // Load CollectionMetadata from meta_store
+                    let meta_bytes = match meta_store.as_ref().get_latest(&"collection_metadata".to_string()) {
+                        Some(bytes) => bytes,
+                        None => {
+                            warn!("No metadata found for collection '{}', skipping", name);
+                            continue;
+                        }
+                    };
+                    let meta: CollectionMetadata = match bincode::deserialize(meta_bytes) {
+                        Ok(m) => m,
             Err(e) => {
-                return Err(WaCustomError::DatabaseError(format!(
-                    "Failed to open properties file {:?}: {}",
-                    prop_file_path, e
-                )));
-            }
-        };
-
-        let index_manager = BufferManagerFactory::new(
-            index_path.clone().into(),
-            |root, ver: &IndexFileId| root.join(format!("{}.index", **ver)),
-            8192,
-        );
-
-        let latest_version_links_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(index_path.join("latest.version"))
-            .map_err(BufIoError::Io)?;
-        let latest_version_links_bufman =
-            BufferManager::new(latest_version_links_file, 8192).map_err(BufIoError::Io)?;
-        let distance_metric = Arc::new(RwLock::new(hnsw_index_data.distance_metric));
-        let cache = HNSWIndexCache::new(
-            index_manager,
-            latest_version_links_bufman,
-            prop_file,
-            distance_metric.clone(),
-        );
-
-        let values_range_result = retrieve_values_range(lmdb);
-        let values_range = match values_range_result {
-            Ok(vr) => vr,
+                            warn!("Failed to deserialize metadata for collection '{}': {}", name, e);
+                            continue;
+                        }
+                    };
+                    // Load current_version from meta_store
+                    let current_version = match retrieve_current_version(&meta_store) {
+                        Ok(v) => v,
             Err(e) => {
-                return Err(WaCustomError::DatabaseError(format!(
-                    "Failed to retrieve values range: {}",
-                    e
-                )));
-            }
-        };
-
-        let first_index_file_path = index_path.join("0.index");
-        let (file_id, offset) = if first_index_file_path.exists() {
-            let mut file_id = 0;
-            let mut offset = fs::metadata(first_index_file_path)
-                .map_err(BufIoError::Io)?
-                .len() as u32;
-            loop {
-                let index_file_path = index_path.join(format!("{}.index", file_id));
-                if index_file_path.exists() {
-                    file_id += 1;
-                    offset = fs::metadata(index_file_path).map_err(BufIoError::Io)?.len() as u32;
-                } else {
-                    break;
-                }
-            }
-
-            (file_id, offset)
-        } else {
-            (0, 0)
-        };
-        let offset_counter = HNSWIndexFileOffsetCounter::from_offset_and_file_id(
-            offset,
-            file_id,
-            cache.latest_version_links_bufman.file_size() as u32,
-            config.index_file_min_size,
-            hnsw_index_data.hnsw_params.level_0_neighbors_count,
-            hnsw_index_data.hnsw_params.neighbors_count,
-        );
-
-        let start = Instant::now();
-        let mut pending_items = FxHashMap::default();
-        let mut latest_version_links = FxHashMap::default();
-
-        let root_ptr_offset = hnsw_index_data.root_vec_ptr_offset;
-        let latest_version_links_cursor = cache.latest_version_links_bufman.open_cursor()?;
-        let root_file_index = SharedLatestNode::deserialize_raw(
-            &cache.latest_version_links_bufman, // not used
-            &cache.latest_version_links_bufman,
-            u64::MAX, // not used
-            latest_version_links_cursor,
-            root_ptr_offset,
-            IndexFileId::invalid(),
-            &cache,
-        )?;
-        let bufman = cache.bufmans.get(root_file_index.file_id)?;
-        let cursor = bufman.open_cursor()?;
-        let root_node_raw = ProbNode::deserialize_raw(
-            &bufman,
-            &cache.latest_version_links_bufman,
-            cursor,
-            latest_version_links_cursor,
-            root_file_index.offset,
-            root_file_index.file_id,
-            &cache,
-        )?;
-        let root_node = ProbNode::build_from_raw(
-            root_node_raw,
-            &cache,
-            &mut pending_items,
-            &mut latest_version_links,
-            latest_version_links_cursor,
-        )?;
-        let root = ProbLazyItem::new(root_node, root_file_index.file_id, root_file_index.offset);
-        cache
-            .registry
-            .insert(HNSWIndexCache::combine_index(&root_file_index), root);
-        let root_ptr = LatestNode::new(root, root_ptr_offset);
-        latest_version_links.insert(root_ptr_offset, root_ptr);
-        bufman.close_cursor(cursor)?;
-
-        let (file_index_sender, file_index_receiver) = channel::unbounded::<FileIndex>();
-        let (raw_node_sender, raw_node_receiver) =
-            channel::unbounded::<(<ProbNode as RawDeserialize>::Raw, FileIndex)>();
-
-        thread::scope(|s| {
-            let mut handles = Vec::new();
-            let file_index_receiver = Arc::new(file_index_receiver);
-            let cache = &cache;
-            for _ in 0..8 {
-                let file_index_receiver = file_index_receiver.clone();
-                let cursors = (0..=offset_counter.file_id)
-                    .map(|file_id| cache.bufmans.get(IndexFileId::from(file_id))?.open_cursor())
-                    .collect::<Result<Vec<_>, _>>()?;
-                let latest_version_links_cursor =
-                    cache.latest_version_links_bufman.open_cursor()?;
-                let raw_node_sender = raw_node_sender.clone();
-                let handle = s.spawn(move || {
-                    for file_index in &*file_index_receiver {
-                        let bufman = cache.bufmans.get(file_index.file_id).unwrap();
-                        let node = ProbNode::deserialize_raw(
-                            &bufman,
-                            &cache.latest_version_links_bufman,
-                            cursors[*file_index.file_id as usize],
-                            latest_version_links_cursor,
-                            file_index.offset,
-                            file_index.file_id,
-                            cache,
-                        )
-                        .unwrap_or_else(|_| {
-                            panic!("failed to load node at file index: {:?}", file_index)
-                        });
-                        raw_node_sender.send((node, file_index)).unwrap();
-                    }
-
-                    for (file_id, cursor) in cursors.into_iter().enumerate() {
-                        let file_id = IndexFileId::from(file_id as u32);
-                        cache.bufmans.get(file_id)?.close_cursor(cursor)?;
-                    }
-
-                    cache
-                        .latest_version_links_bufman
-                        .close_cursor(latest_version_links_cursor)?;
-
-                    Ok::<_, WaCustomError>(())
-                });
-                handles.push(handle);
-            }
-
-            while !pending_items.is_empty() {
-                let keys = pending_items.keys().cloned().collect::<Vec<_>>();
-                let len = keys.len();
-                for file_index in keys {
-                    file_index_sender.send(file_index).unwrap();
-                }
-
-                for _ in 0..len {
-                    let (raw, file_index) = raw_node_receiver.recv().unwrap();
-
-                    let node = ProbNode::build_from_raw(
-                        raw,
-                        cache,
-                        &mut pending_items,
-                        &mut latest_version_links,
-                        latest_version_links_cursor,
+                            warn!("Failed to load current_version for collection '{}': {}", name, e);
+                            continue;
+                        }
+                    };
+                    // Use Option for vcs and ctx to allow compilation
+                    let dummy_env = Arc::new(Environment::new().set_max_dbs(1).open(std::path::Path::new("/tmp")).unwrap());
+                    let dummy_db = dummy_env.create_db(Some("dummy"), DatabaseFlags::empty()).unwrap();
+                    let vcs = VersionControl::from_existing(dummy_env, dummy_db);
+                    let dummy_config = Arc::new(Config {
+                        thread_pool: crate::config_loader::ThreadPool { pool_size: 1 },
+                        server: Server {
+                            host: Host::Hostname("localhost".to_string()),
+                            port: Port::from(8080),
+                            ssl: Ssl {
+                                cert_file: std::path::PathBuf::from("dummy.crt"),
+                                key_file: std::path::PathBuf::from("dummy.key"),
+                            },
+                            mode: ServerMode::Http,
+                        },
+                        hnsw: Hnsw {
+                            default_neighbors_count: 1,
+                            default_level_0_neighbors_count: 1,
+                            default_ef_construction: 1,
+                            default_ef_search: 1,
+                            default_num_layer: 1,
+                            default_max_cache_size: 1,
+                        },
+                        indexing: Indexing {
+                            clamp_margin_percent: 0.0,
+                            mode: VectorsIndexingMode::Sequential,
+                        },
+                        search: Search {
+                            shortlist_size: 1,
+                            early_terminate_threshold: 0.0,
+                        },
+                        upload_threshold: 1,
+                        upload_process_batch_size: 1,
+                        num_regions_to_load_on_restart: 1,
+                        inverted_index_data_file_parts: 1,
+                        tree_map_serialized_parts: 1,
+                        sparse_raw_values_reranking_factor: 1,
+                        rerank_sparse_with_raw_values: false,
+                        index_file_min_size: 1,
+                        cache: CacheConfig::default(),
+                    });
+                    let dummy_threadpool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+                    let dummy_app_env = Arc::new(AppEnv {
+                        collections_map: CollectionsMap::new(),
+                        users_map: UsersMap::new(Arc::new(Environment::new().set_max_dbs(1).open(std::path::Path::new("/tmp")).unwrap())).unwrap(),
+                        persist: Arc::new(Environment::new().set_max_dbs(1).open(std::path::Path::new("/tmp")).unwrap()),
+                        admin_key: SingleSHA256Hash([0u8; 32]),
+                        active_sessions: Arc::new(DashMap::new()),
+                    });
+                    let ctx = AppContext {
+                        config: dummy_config.clone(),
+                        threadpool: dummy_threadpool.clone(),
+                        ain_env: dummy_app_env.clone(),
+                        collection_cache_manager: Arc::new(CollectionCacheManager::new(
+                            Arc::from(std::path::Path::new("/tmp")),
+                            1, // max_collections
+                            0.1, // eviction_probability
+                            dummy_app_env.clone(),
+                        )),
+                    };
+                    let collection = Collection::new(
+                        name.clone(),
+                        meta.description.clone(),
+                        meta.dense_vector.clone(),
+                        meta.sparse_vector.clone(),
+                        meta.tf_idf_options.clone(),
+                        meta.metadata_schema.clone(),
+                        meta.config.clone(),
+                        meta.store_raw_text,
+                        meta_store,
+                        current_version,
+                        vcs,
+                        &ctx,
                     )?;
-                    let lazy_item = pending_items.remove(&file_index).unwrap();
-                    let lazy_item_ref = unsafe { &*lazy_item };
-                    lazy_item_ref.set_data(node);
-                    cache
-                        .registry
-                        .insert(HNSWIndexCache::combine_index(&file_index), lazy_item);
+                    map.inner_collections.insert(name, collection);
                 }
             }
-
-            drop(file_index_sender);
-
-            for handle in handles {
-                handle.join().unwrap()?;
-            }
-
-            Ok::<_, WaCustomError>(())
-        })?;
-
-        println!("Dense index loaded in {:?}", start.elapsed());
-        cache
-            .latest_version_links_bufman
-            .close_cursor(latest_version_links_cursor)?;
-
-        let hnsw_index = HNSWIndex::new(
-            root_ptr,
-            hnsw_index_data.levels_prob,
-            hnsw_index_data.dim,
-            hnsw_index_data.quantization_metric,
-            distance_metric,
-            hnsw_index_data.storage_type,
-            hnsw_index_data.hnsw_params,
-            cache,
-            values_range.unwrap_or((-1.0, 1.0)),
-            hnsw_index_data.sample_threshold,
-            values_range.is_some(),
-            max_replicas_per_node,
-            offset_counter,
-        );
-
-        Ok(Some(hnsw_index))
-    }
-
-    /// loads and initiates the inverted index of a collection from lmdb
-    fn load_inverted_index(
-        &self,
-        collection_meta: &CollectionMetadata,
-        lmdb: &MetaDb,
-        config: &Config,
-    ) -> Result<Option<InvertedIndex>, WaCustomError> {
-        let collection_path: Arc<Path> = get_collections_path().join(&collection_meta.name).into();
-        let index_path = collection_path.join("sparse_inverted_index");
-
-        if !index_path.exists() {
-            return Ok(None);
         }
-
-        let Some(inverted_index_data) = InvertedIndex::load_data(
-            &self.lmdb_env,
-            self.lmdb_inverted_index_db,
-            &collection_meta.name,
-        )?
-        else {
-            return Ok(None);
-        };
-
-        let values_upper_bound = retrieve_values_upper_bound(lmdb)?;
-        let inverted_index = InvertedIndex {
-            root: InvertedIndexRoot::deserialize(
-                index_path,
-                inverted_index_data.quantization_bits,
-                config.inverted_index_data_file_parts,
-            )?,
-            values_upper_bound: RwLock::new(values_upper_bound.unwrap_or(1.0)),
-            is_configured: AtomicBool::new(values_upper_bound.is_some()),
-            vectors: RwLock::new(Vec::new()),
-            vectors_collected: AtomicUsize::new(0),
-            sampling_data: crate::indexes::inverted::types::SamplingData::default(),
-            sample_threshold: inverted_index_data.sample_threshold,
-        };
-
-        Ok(Some(inverted_index))
+        Ok(map)
     }
 
-    /// loads and initiates the TF-IDF index of a collection from lmdb
-    fn load_tf_idf_index(
-        &self,
-        collection_meta: &CollectionMetadata,
-        lmdb: &MetaDb,
-        config: &Config,
-    ) -> Result<Option<TFIDFIndex>, WaCustomError> {
-        let collection_path: Arc<Path> = get_collections_path().join(&collection_meta.name).into();
-        let index_path = collection_path.join("tf_idf_index");
-
-        if !index_path.exists() {
-            return Ok(None);
-        }
-
-        let Some(inverted_index_data) = TFIDFIndex::load_data(
-            &self.lmdb_env,
-            self.lmdb_tf_idf_index_db,
-            &collection_meta.name,
-        )?
-        else {
-            return Ok(None);
-        };
-
-        let average_document_length = retrieve_average_document_length(lmdb)?;
-        let inverted_index = TFIDFIndex {
-            root: TFIDFIndexRoot::deserialize(index_path, config.inverted_index_data_file_parts)?,
-            average_document_length: RwLock::new(average_document_length.unwrap_or(1.0)),
-            is_configured: AtomicBool::new(average_document_length.is_some()),
-            documents: RwLock::new(Vec::new()),
-            documents_collected: AtomicUsize::new(0),
-            sampling_data: crate::indexes::tf_idf::SamplingData::default(),
-            sample_threshold: inverted_index_data.sample_threshold,
-            k1: inverted_index_data.k1,
-            b: inverted_index_data.b,
-        };
-
-        Ok(Some(inverted_index))
-    }
-
-    pub fn insert_hnsw_index(
-        &self,
-        collection: &Collection,
-        hnsw_index: Arc<HNSWIndex>,
-    ) -> Result<(), WaCustomError> {
-        hnsw_index.persist(
-            &collection.meta.name,
-            &self.lmdb_env,
-            self.lmdb_hnsw_index_db,
-        )?;
-        *collection.hnsw_index.write() = Some(hnsw_index);
-        Ok(())
-    }
-
-    pub fn insert_inverted_index(
-        &self,
-        collection: &Collection,
-        inverted_index: Arc<InvertedIndex>,
-    ) -> Result<(), WaCustomError> {
-        inverted_index.persist(
-            &collection.meta.name,
-            &self.lmdb_env,
-            self.lmdb_inverted_index_db,
-        )?;
-        *collection.inverted_index.write() = Some(inverted_index);
-        Ok(())
-    }
-
-    pub fn insert_tf_idf_index(
-        &self,
-        collection: &Collection,
-        tf_idf_index: Arc<TFIDFIndex>,
-    ) -> Result<(), WaCustomError> {
-        tf_idf_index.persist(
-            &collection.meta.name,
-            &self.lmdb_env,
-            self.lmdb_tf_idf_index_db,
-        )?;
-        *collection.tf_idf_index.write() = Some(tf_idf_index);
-        Ok(())
-    }
-
-    /// inserts a collection into the collections map
-    #[allow(dead_code)]
     pub fn insert_collection(&self, collection: Arc<Collection>) -> Result<(), WaCustomError> {
-        self.inner_collections
-            .insert(collection.meta.name.to_owned(), collection);
+        self.inner_collections.insert(collection.meta.name.clone(), collection);
         Ok(())
     }
 
-    /// Returns the `Collection` by collection's name
-    ///
-    /// If not found, None is returned
-    ///
-    /// Note that it tried to look up the Collections in the DashMap
-    /// only and doesn't check LMDB. This is because of the assumption
-    /// that at startup, all collections will be loaded from LMDB
-    /// into the in-memory DashMap and when a new collection is
-    /// added, it will be written to the DashMap as well.
-    ///
-    /// @TODO: As a future improvement, we can fallback to checking if
-    /// the Collection exists in LMDB and caching it. But it's not
-    /// required for the current use case.
     pub fn get_collection(&self, name: &str) -> Option<Arc<Collection>> {
-        self.inner_collections.get(name).map(|index| index.clone())
+        self.inner_collections.get(name).map(|c| c.clone())
     }
 
-    pub fn remove_hnsw_index(&self, name: &str) -> Result<Option<Arc<HNSWIndex>>, WaCustomError> {
-        match self.inner_collections.get(name) {
-            Some(collection) => match collection.hnsw_index.write().take() {
-                Some(hnsw_index) => {
-                    HNSWIndex::delete(&self.lmdb_env, self.lmdb_hnsw_index_db, name)?;
-                    Ok(Some(hnsw_index))
-                }
-                None => Ok(None),
-            },
-            None => Ok(None),
-        }
-    }
-
-    pub fn remove_inverted_index(
-        &self,
-        name: &str,
-    ) -> Result<Option<Arc<InvertedIndex>>, WaCustomError> {
-        match self.inner_collections.get(name) {
-            Some(collection) => match collection.inverted_index.write().take() {
-                Some(inverted_index) => {
-                    InvertedIndex::delete(&self.lmdb_env, self.lmdb_inverted_index_db, name)?;
-                    Ok(Some(inverted_index))
-                }
-                None => Ok(None),
-            },
-            None => Ok(None),
-        }
-    }
-
-    pub fn remove_tf_idf_index(
-        &self,
-        name: &str,
-    ) -> Result<Option<Arc<TFIDFIndex>>, WaCustomError> {
-        match self.inner_collections.get(name) {
-            Some(collection) => match collection.tf_idf_index.write().take() {
-                Some(tf_idf_index) => {
-                    TFIDFIndex::delete(&self.lmdb_env, self.lmdb_tf_idf_index_db, name)?;
-                    Ok(Some(tf_idf_index))
-                }
-                None => Ok(None),
-            },
-            None => Ok(None),
-        }
-    }
-
-    /// removes a collection from the in-memory map
-    ///
-    /// returns the removed collection in case of success
-    ///
-    /// returns error if not found
-    #[allow(dead_code)]
     pub fn remove_collection(&self, name: &str) -> Result<Arc<Collection>, WaCustomError> {
-        match self.inner_collections.remove(name) {
-            Some((_, collection)) => Ok(collection),
-            None => {
-                // collection not found, return an error response
-                Err(WaCustomError::NotFound("collection".into()))
-            }
-        }
+        self.inner_collections.remove(name).map(|(_, c)| c).ok_or(WaCustomError::NotFound("collection not found".to_string()))
     }
 
-    /// returns an iterator
-    #[allow(dead_code)]
-    pub fn iter_collections(
-        &self,
-    ) -> dashmap::iter::Iter<
-        String,
-        Arc<Collection>,
-        std::hash::RandomState,
-        DashMap<String, Arc<Collection>>,
-    > {
+    pub fn iter_collections(&self) -> dashmap::iter::Iter<String, Arc<Collection>, std::hash::RandomState, DashMap<String, Arc<Collection>>> {
         self.inner_collections.iter()
     }
 }
@@ -1378,21 +885,13 @@ pub fn get_app_env(
         .map_err(|err| WaCustomError::DatabaseError(err.to_string()))?;
 
     // Add more resilient error handling for collections_map loading
-    let collections_map = match CollectionsMap::load(env_arc.clone(), config, threadpool) {
+    let collections_map = match CollectionsMap::load_from_disk(config, threadpool) {
         Ok(map) => map,
         Err(_e) => {
             //println!("Warning: Failed to load collections map: {}", e);
             //println!("Creating a new collections map...");
             // Use the correct function signature for CollectionsMap::new
-            match CollectionsMap::new(env_arc.clone()) {
-                Ok(empty_map) => empty_map,
-                Err(err) => {
-                    return Err(WaCustomError::DatabaseError(format!(
-                        "Failed to create empty collections map: {}",
-                        err
-                    )));
-                }
-            }
+            CollectionsMap::new()
         }
     };
 

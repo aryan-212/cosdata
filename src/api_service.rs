@@ -82,7 +82,7 @@ pub async fn init_hnsw_index_for_collection(
         distance_metric.clone(),
     );
     if let Some(values_range) = values_range {
-        store_values_range(&lmdb, values_range).map_err(|e| {
+        store_values_range(&collection.meta_store, values_range).map_err(|e| {
             WaCustomError::DatabaseError(format!("Failed to store values range to LMDB: {}", e))
         })?;
     }
@@ -157,9 +157,7 @@ pub async fn init_hnsw_index_for_collection(
         offset_counter,
     ));
 
-    ctx.ain_env
-        .collections_map
-        .insert_hnsw_index(&collection, hnsw_index.clone())?;
+    // ctx.ain_env.collections_map.insert_hnsw_index(&collection, hnsw_index.clone())?;
 
     // If the collection has metadata schema, we create pseudo replica
     // nodes to ensure that the query vectors with metadata dimensions
@@ -178,7 +176,7 @@ pub async fn init_hnsw_index_for_collection(
         transaction.pre_commit(&collection, &ctx.config)?;
         *collection.current_version.write() = version;
         collection.vcs.set_current_version(version, false)?;
-        update_current_version(&collection.lmdb, version)?;
+        update_current_version(&collection.meta_store, version)?;
     }
 
     Ok(hnsw_index)
@@ -202,9 +200,7 @@ pub async fn init_inverted_index_for_collection(
         ctx.config.inverted_index_data_file_parts,
     )?);
 
-    ctx.ain_env
-        .collections_map
-        .insert_inverted_index(collection, index.clone())?;
+    // ctx.ain_env.collections_map.insert_inverted_index(collection, index.clone())?;
     Ok(index)
 }
 
@@ -228,8 +224,6 @@ pub async fn init_tf_idf_index_for_collection(
         b,
     )?);
 
-    ctx.ain_env
-        .collections_map
-        .insert_tf_idf_index(collection, index.clone())?;
+    // ctx.ain_env.collections_map.insert_tf_idf_index(collection, index.clone())?;
     Ok(index)
 }

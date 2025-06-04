@@ -8,9 +8,9 @@ use crate::{
         collection_transaction::BackgroundCollectionTransaction,
         common::WaCustomError,
         inverted_index::InvertedIndexRoot,
-        meta_persist::store_values_upper_bound,
+        meta_persist::{store_values_upper_bound, MetaStore},
         sparse_ann_query::{SparseAnnQueryBasic, SparseAnnResult},
-        types::{InternalId, MetaDb, SparseVector},
+        types::{InternalId, SparseVector},
         versioning::VersionNumber,
     },
 };
@@ -164,7 +164,7 @@ impl IndexOps for InvertedIndex {
 
     fn finalize_sampling(
         &self,
-        lmdb: &MetaDb,
+        meta_store: &MetaStore,
         config: &Config,
         _embeddings: &[Self::IndexingInput],
     ) -> Result<(), WaCustomError> {
@@ -213,7 +213,7 @@ impl IndexOps for InvertedIndex {
 
         *self.values_upper_bound.write().unwrap() = values_upper_bound;
         self.is_configured.store(true, Ordering::Release);
-        store_values_upper_bound(lmdb, values_upper_bound)?;
+        store_values_upper_bound(meta_store, values_upper_bound)?;
         Ok(())
     }
 

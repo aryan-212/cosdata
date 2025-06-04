@@ -143,7 +143,7 @@ impl IndexingManager {
         let delta = end - start;
         let delta_seconds = (delta.num_seconds() as u32).max(1);
         txn.pre_commit(collection, config)?;
-        update_background_version(&collection.lmdb, version)?;
+        update_background_version(&collection.meta_store, version)?;
         fs::remove_file(collection.get_path().join(format!("{}.wal", *version)))
             .map_err(BufIoError::Io)?;
         let total_records_indexed = records_indexed.load(Ordering::Relaxed);
@@ -201,7 +201,7 @@ impl IndexingManager {
         let delta = end - start;
         let delta_seconds = (delta.num_seconds() as u32).max(1);
         txn.pre_commit(collection, config)?;
-        update_background_version(&collection.lmdb, version)?;
+        update_background_version(&collection.meta_store, version)?;
         *status.write() = TransactionStatus::Complete {
             summary: Summary {
                 total_records_indexed: vectors_count,

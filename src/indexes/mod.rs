@@ -2,7 +2,6 @@ use rayon::prelude::*;
 
 use std::{hash::Hasher, sync::RwLock};
 
-use lmdb::{Transaction, WriteFlags};
 use siphasher::sip::SipHasher24;
 
 use crate::{
@@ -11,7 +10,8 @@ use crate::{
         collection::Collection,
         collection_transaction::BackgroundCollectionTransaction,
         common::WaCustomError,
-        types::{DocumentId, InternalId, MetaDb, VectorId},
+        meta_persist::MetaStore,
+        types::{DocumentId, InternalId, VectorId},
     },
 };
 
@@ -44,7 +44,7 @@ pub trait IndexOps: Send + Sync {
         transaction: &BackgroundCollectionTransaction,
         config: &Config,
     ) -> Result<(), WaCustomError> {
-        let Some(embeddings) = self.sample_embeddings(&collection.lmdb, embeddings, config)? else {
+        let Some(embeddings) = self.sample_embeddings(&collection.meta_store, embeddings, config)? else {
             return Ok(());
         };
 
@@ -67,7 +67,7 @@ pub trait IndexOps: Send + Sync {
     ) -> Result<(), WaCustomError> {
         if !self.is_configured() {
             let mut embeddings_guard = self.embeddings_collected().write().unwrap();
-            self.finalize_sampling(&collection.lmdb, config, &embeddings_guard)?;
+            self.finalize_sampling(&collection.meta_store, config, &embeddings_guard)?;
             let embeddings = std::mem::take(&mut *embeddings_guard);
             self.index_embeddings(collection, embeddings, transaction, config)?;
         }
@@ -76,7 +76,7 @@ pub trait IndexOps: Send + Sync {
 
     fn sample_embeddings(
         &self,
-        lmdb: &MetaDb,
+        meta_store: &MetaStore,
         sample_embeddings: Vec<Self::IndexingInput>,
         config: &Config,
     ) -> Result<Option<Vec<Self::IndexingInput>>, WaCustomError> {
@@ -98,7 +98,7 @@ pub trait IndexOps: Send + Sync {
                 return Ok(None);
             }
 
-            self.finalize_sampling(lmdb, config, &collected_embeddings)?;
+            self.finalize_sampling(meta_store, config, &collected_embeddings)?;
 
             Ok(Some(std::mem::take(&mut *collected_embeddings)))
         } else {
@@ -111,7 +111,7 @@ pub trait IndexOps: Send + Sync {
 
     fn finalize_sampling(
         &self,
-        lmdb: &MetaDb,
+        meta_store: &MetaStore,
         config: &Config,
         embeddings: &[Self::IndexingInput],
     ) -> Result<(), WaCustomError>;
@@ -147,53 +147,6 @@ pub trait IndexOps: Send + Sync {
     }
 
     fn get_data(&self) -> Self::Data;
-
-    fn persist(
-        &self,
-        collection_name: &str,
-        env: &lmdb::Environment,
-        db: lmdb::Database,
-    ) -> Result<(), WaCustomError> {
-        let data = self.get_data();
-        let key = Self::get_key_for_name(collection_name).to_le_bytes();
-        let val = serde_cbor::to_vec(&data)
-            .map_err(|e| WaCustomError::SerializationError(e.to_string()))?;
-
-        let mut txn = env.begin_rw_txn()?;
-        txn.put(db, &key, &val, WriteFlags::empty())?;
-        txn.commit()?;
-        Ok(())
-    }
-
-    fn load_data(
-        env: &lmdb::Environment,
-        db: lmdb::Database,
-        collection_name: &str,
-    ) -> Result<Option<Self::Data>, WaCustomError> {
-        let txn = env.begin_ro_txn()?;
-        let key = Self::get_key_for_name(collection_name).to_le_bytes();
-        let data_bytes = match txn.get(db, &key) {
-            Ok(bytes) => Ok(bytes),
-            Err(lmdb::Error::NotFound) => return Ok(None),
-            Err(err) => Err(err),
-        }?;
-        let data = serde_cbor::from_slice(data_bytes)
-            .map_err(|e| WaCustomError::DeserializationError(e.to_string()))?;
-
-        Ok(data)
-    }
-
-    fn delete(
-        env: &lmdb::Environment,
-        db: lmdb::Database,
-        collection_name: &str,
-    ) -> Result<(), WaCustomError> {
-        let key = Self::get_key_for_name(collection_name).to_le_bytes();
-        let mut txn = env.begin_rw_txn()?;
-        txn.del(db, &key, None)?;
-        txn.commit()?;
-        Ok(())
-    }
 
     fn search_internal(
         &self,

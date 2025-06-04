@@ -43,7 +43,7 @@ pub(crate) async fn upsert_vectors(
         .vcs
         .set_current_version(version, true)
         .map_err(|err| TransactionError::FailedToCommitTransaction(err.to_string()))?;
-    update_current_version(&collection.lmdb, version)
+    update_current_version(&collection.meta_store, version)
         .map_err(|err| TransactionError::FailedToCommitTransaction(err.to_string()))?;
 
     IndexingManager::explicit_txn_upsert(
@@ -88,7 +88,7 @@ pub(crate) async fn delete_vector_by_id(
         .vcs
         .set_current_version(version, true)
         .map_err(|err| TransactionError::FailedToCommitTransaction(err.to_string()))?;
-    update_current_version(&collection.lmdb, version)
+    update_current_version(&collection.meta_store, version)
         .map_err(|err| TransactionError::FailedToCommitTransaction(err.to_string()))?;
 
     collection.transaction_status_map.insert(
