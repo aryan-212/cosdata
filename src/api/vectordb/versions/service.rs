@@ -14,11 +14,24 @@ pub(crate) async fn list_versions(
         .collections_map
         .get_collection(collection_id)
         .ok_or_else(|| VersionError::DatabaseError("Collection not found".to_string()))?;
-    let versions = collection
+    let mut versions = collection
         .vcs
         .get_versions()
         .map_err(|e| WaCustomError::DatabaseError(e.to_string()))?;
     let current_version = *collection.current_version.read();
+
+    // Patch the last version if it is an open implicit (epoch) version
+    if let Some(last) = versions.last_mut() {
+        use crate::models::versioning::VersionSource;
+        if let VersionSource::Implicit { .. } = last.source {
+            if let Some((open_version, upsert_count)) = collection.current_implicit_transaction.read().get_open_epoch_upsert_count() {
+                if open_version == last.version {
+                    let upserts = upsert_count.load(std::sync::atomic::Ordering::Relaxed);
+                    last.records_upserted = upserts;
+                }
+            }
+        }
+    }
 
     // Calculate cumulative vector counts for each version
     let mut cumulative_count = 0u64;

@@ -177,10 +177,11 @@ pub struct ImplicitTransactionData {
     version: VersionNumber,
     thread_handle: thread::JoinHandle<Result<DurableWALFile, WaCustomError>>,
     channel: mpsc::Sender<VectorOp>,
+    pub upsert_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 pub struct ImplicitTransaction {
-    data: RwLock<Option<ImplicitTransactionData>>,
+    data: RwLock<Option<std::sync::Arc<ImplicitTransactionData>>>,
 }
 
 impl Default for ImplicitTransaction {
@@ -211,18 +212,27 @@ impl ImplicitTransaction {
         let (tx, rx) = mpsc::channel();
         let version = *last_allotted_version;
         let wal = DurableWALFile::new(&collection.get_path(), version)?;
+        let upsert_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let upsert_count_clone = upsert_count.clone();
         let thread_handle = thread::spawn(move || {
             let mut wal = wal;
             for op in rx {
+                match &op {
+                    VectorOp::Upsert(vectors) => {
+                        upsert_count_clone.fetch_add(vectors.len() as u32, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
                 wal.append(op)?;
             }
             Ok(wal)
         });
-        *data = Some(ImplicitTransactionData {
+        *data = Some(std::sync::Arc::new(ImplicitTransactionData {
             version,
             thread_handle,
             channel: tx,
-        });
+            upsert_count,
+        }));
         collection
             .vcs
             .set_current_version_implicit(version, random())?;
@@ -249,9 +259,10 @@ impl ImplicitTransaction {
     }
 
     pub fn pre_commit(self, collection: &Collection, config: &Config) -> Result<(), WaCustomError> {
-        let Some(data) = self.data.into_inner() else {
+        let Some(data_arc) = self.data.into_inner() else {
             return Ok(());
         };
+        let data = std::sync::Arc::try_unwrap(data_arc).ok().expect("No other Arc references should exist at pre_commit");
         if let Some(hnsw_index) = &*collection.hnsw_index.read() {
             hnsw_index.pre_commit_transaction(collection, data.version, config)?;
         }
@@ -275,6 +286,10 @@ impl ImplicitTransaction {
         fs::remove_file(collection.get_path().join(format!("{}.wal", *data.version)))
             .map_err(BufIoError::Io)?;
         Ok(())
+    }
+
+    pub fn get_open_epoch_upsert_count(&self) -> Option<(VersionNumber, std::sync::Arc<std::sync::atomic::AtomicU32>)> {
+        self.data.read().as_ref().map(|d| (d.version, d.upsert_count.clone()))
     }
 }
 

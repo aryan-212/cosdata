@@ -4,6 +4,7 @@ use crate::metadata::gen_combinations;
 
 use super::{
     decimal_to_binary_vec, nearest_power_of_two, Error, FieldName, FieldValue, MetadataFields,
+    decimal_to_binary_vec_memoized, gen_combinations_optimized,
 };
 use std::{
     cmp::Reverse,
@@ -255,6 +256,7 @@ impl MetadataSchema {
             }
             result.push(m);
         }
+
         result
     }
 
@@ -273,7 +275,7 @@ impl MetadataSchema {
         weight: i32,
     ) -> Result<Vec<MetadataDimensions>, Error> {
         let field_combinations = self.input_field_combinations(fields);
-        // We cache the results of calling fn `decimal_to_binary_vec`
+        // We cache the results of calling fn `decimal_to_binary_vec_memoized`
         // as there's a chance it would get called multiple times for
         // the same input
         let mut cache: HashMap<(u16, usize), Vec<i32>> = HashMap::new();
@@ -288,7 +290,7 @@ impl MetadataSchema {
                         match cache.get(&(value_id, size)) {
                             Some(r) => r.clone(),
                             None => {
-                                let dims = decimal_to_binary_vec(value_id, size)
+                                let dims = decimal_to_binary_vec_memoized(value_id, size)
                                     .iter()
                                     .map(|x| (*x as i32) * weight)
                                     .collect::<Vec<i32>>();
@@ -350,7 +352,7 @@ impl MetadataSchema {
                     vs.push(vec![0]);
                 }
             }
-            let mut cs = gen_combinations(&vs);
+            let mut cs = gen_combinations_optimized(&vs);
             combinations.append(&mut cs);
         }
 
@@ -370,7 +372,7 @@ impl MetadataSchema {
                         vs.push(vec![0]);
                     }
                 }
-                let mut cs = gen_combinations(&vs);
+                let mut cs = gen_combinations_optimized(&vs);
                 combinations.append(&mut cs);
 
                 // Check if the schema supports an `And` condition
@@ -389,7 +391,7 @@ impl MetadataSchema {
         // Convert combinations of valid_ids into pseudo_dimensions
         // (binary_vec with high weight values)
         let mut pseudo_dimensions = Vec::with_capacity(combinations.len());
-        // We cache the results of calling fn `decimal_to_binary_vec`
+        // We cache the results of calling fn `decimal_to_binary_vec_memoized`
         // as there's a chance it would get called multiple times for
         // the same input
         let mut cache: HashMap<(u16, usize), Vec<i32>> = HashMap::new();
@@ -401,7 +403,7 @@ impl MetadataSchema {
                 let mut field_dims = match cache.get(&(*value_id, size)) {
                     Some(r) => r.clone(),
                     None => {
-                        let r = decimal_to_binary_vec(*value_id, size)
+                        let r = decimal_to_binary_vec_memoized(*value_id, size)
                             .iter()
                             .map(|x| (*x as i32) * weight)
                             .collect::<Vec<i32>>();

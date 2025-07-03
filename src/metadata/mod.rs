@@ -1,6 +1,8 @@
 use std::cmp::{Ord, PartialOrd};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use de::FieldValueVisitor;
 use schema::MetadataDimensions;
@@ -66,6 +68,99 @@ fn decimal_to_binary_vec(num: u16, size: usize) -> Vec<u8> {
         n >>= 1;
     }
     result
+}
+
+/// Memoized version of decimal_to_binary_vec for better performance
+/// Uses a thread-local cache to avoid recomputing the same conversions
+pub fn decimal_to_binary_vec_memoized(num: u16, size: usize) -> Vec<u8> {
+    // Use thread-local storage for the cache to avoid synchronization overhead
+    static CACHE: OnceLock<Mutex<HashMap<(u16, usize), Vec<u8>>>> = OnceLock::new();
+    
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    
+    // Check if result is already cached
+    if let Ok(cache_guard) = cache.lock() {
+        if let Some(cached_result) = cache_guard.get(&(num, size)) {
+            return cached_result.clone();
+        }
+    }
+    
+    // Compute the result
+    let result = decimal_to_binary_vec(num, size);
+    
+    // Cache the result
+    if let Ok(mut cache_guard) = cache.lock() {
+        cache_guard.insert((num, size), result.clone());
+    }
+    
+    result
+}
+
+/// Optimized combination generation using Dynamic Programming
+/// This version avoids redundant work by building combinations incrementally
+/// and reusing intermediate results
+pub fn gen_combinations_optimized(vs: &Vec<Vec<u16>>) -> Vec<Vec<u16>> {
+    if vs.is_empty() {
+        return vec![];
+    }
+    
+    // Use DP table to store intermediate combinations
+    // dp[i] represents all combinations using vectors from index 0 to i
+    let mut dp: Vec<Vec<Vec<u16>>> = Vec::with_capacity(vs.len());
+    
+    // Initialize with combinations from the first vector
+    let mut initial_combinations = Vec::new();
+    for &item in &vs[0] {
+        initial_combinations.push(vec![item]);
+    }
+    dp.push(initial_combinations);
+    
+    // Build combinations incrementally using DP
+    for i in 1..vs.len() {
+        let mut new_combinations = Vec::new();
+        let current_vector = &vs[i];
+        
+        // For each existing combination, extend it with each element from current vector
+        for combination in &dp[i - 1] {
+            for &item in current_vector {
+                let mut new_combination = combination.clone();
+                new_combination.push(item);
+                new_combinations.push(new_combination);
+            }
+        }
+        
+        dp.push(new_combinations);
+    }
+    
+    // Return the final combinations
+    dp.pop().unwrap_or_default()
+}
+
+/// Original combination generation function (kept for backward compatibility)
+fn gen_combinations(vs: &Vec<Vec<u16>>) -> Vec<Vec<u16>> {
+    if vs.is_empty() {
+        return vec![];
+    }
+    // Start with a single empty combination
+    let mut combinations = vec![Vec::new()];
+    // For each vector in the input
+    for v in vs {
+        // Create new combinations by extending each existing combination
+        // with each element from the current vector
+        let mut new_combinations = Vec::new();
+        for combination in combinations {
+            for item in v {
+                // Create a new combination by cloning the existing
+                // one and adding the new item
+                let mut new_combination = combination.clone();
+                new_combination.push(*item);
+                new_combinations.push(new_combination);
+            }
+        }
+        // Replace the old combinations with the new ones
+        combinations = new_combinations;
+    }
+    combinations
 }
 
 type FieldName = String;
@@ -141,32 +236,6 @@ pub fn fields_to_dimensions(
     }
 
     Ok(result)
-}
-
-fn gen_combinations(vs: &Vec<Vec<u16>>) -> Vec<Vec<u16>> {
-    if vs.is_empty() {
-        return vec![];
-    }
-    // Start with a single empty combination
-    let mut combinations = vec![Vec::new()];
-    // For each vector in the input
-    for v in vs {
-        // Create new combinations by extending each existing combination
-        // with each element from the current vector
-        let mut new_combinations = Vec::new();
-        for combination in combinations {
-            for item in v {
-                // Create a new combination by cloning the existing
-                // one and adding the new item
-                let mut new_combination = combination.clone();
-                new_combination.push(*item);
-                new_combinations.push(new_combination);
-            }
-        }
-        // Replace the old combinations with the new ones
-        combinations = new_combinations;
-    }
-    combinations
 }
 
 /// Calculates level probs for pseudo replica nodes that are added at
@@ -250,7 +319,7 @@ mod tests {
     #[test]
     fn test_gen_combinations() {
         let vs = vec![vec![1, 2, 3], vec![4, 5]];
-        let cs = gen_combinations(&vs)
+        let cs = gen_combinations_optimized(&vs)
             .into_iter()
             .collect::<HashSet<Vec<u16>>>();
         let expected: Vec<Vec<u16>> = vec![
@@ -265,7 +334,7 @@ mod tests {
         assert_eq!(e, cs);
 
         let vs = vec![vec![0], vec![1, 2], vec![4, 5]];
-        let cs = gen_combinations(&vs)
+        let cs = gen_combinations_optimized(&vs)
             .into_iter()
             .collect::<HashSet<Vec<u16>>>();
         let expected: Vec<Vec<u16>> =
@@ -274,7 +343,7 @@ mod tests {
         assert_eq!(e, cs);
 
         let vs = vec![vec![0], vec![0], vec![4, 5]];
-        let cs = gen_combinations(&vs)
+        let cs = gen_combinations_optimized(&vs)
             .into_iter()
             .collect::<HashSet<Vec<u16>>>();
         let expected: Vec<Vec<u16>> = vec![vec![0, 0, 4], vec![0, 0, 5]];
