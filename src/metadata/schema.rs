@@ -274,6 +274,15 @@ impl MetadataSchema {
         fields: &HashMap<FieldName, FieldValue>,
         weight: i32,
     ) -> Result<Vec<MetadataDimensions>, Error> {
+        // Create a cache key for this specific call
+        let cache_key = format!("{:?}_{}", fields, weight);
+        let dimensions_cache = super::get_dimensions_cache();
+        
+        // Check if result is already cached
+        if let Some(cached_result) = dimensions_cache.get(&(cache_key.clone(), None)) {
+            return Ok(cached_result.clone());
+        }
+        
         let field_combinations = self.input_field_combinations(fields);
         // We cache the results of calling fn `decimal_to_binary_vec_memoized`
         // as there's a chance it would get called multiple times for
@@ -305,6 +314,10 @@ impl MetadataSchema {
             }
             result.push(dims);
         }
+        
+        // Cache the result
+        dimensions_cache.insert((cache_key, None), result.clone());
+        
         Ok(result)
     }
 
@@ -321,6 +334,15 @@ impl MetadataSchema {
     // two separate functions because the pseudo root node and other
     // pseudo nodes are created in separate code paths.
     pub fn pseudo_nonroot_dimensions(&self, weight: i32) -> Vec<MetadataDimensions> {
+        // Create a cache key for this specific call
+        let cache_key = format!("pseudo_nonroot_{:?}_{}", self.fields, weight);
+        let dimensions_cache = super::get_dimensions_cache();
+        
+        // Check if result is already cached
+        if let Some(cached_result) = dimensions_cache.get(&(cache_key.clone(), Some("pseudo_nonroot".to_string()))) {
+            return cached_result.clone();
+        }
+        
         // A hashmap of field names to the value_ids in asc
         // order. Will be constructed when iterting through the fields
         // for the first time.
@@ -422,6 +444,9 @@ impl MetadataSchema {
             let root_dims = self.pseudo_root_dimensions(weight);
             pseudo_dimensions.retain(|dims| *dims != root_dims);
         }
+        
+        // Cache the result
+        dimensions_cache.insert((cache_key, Some("pseudo_nonroot".to_string())), pseudo_dimensions.clone());
 
         pseudo_dimensions
     }

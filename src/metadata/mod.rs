@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use dashmap::DashMap;
 
 use de::FieldValueVisitor;
 use schema::MetadataDimensions;
@@ -19,6 +20,54 @@ use crate::models::common::generate_level_probs;
 use crate::models::types::InternalId;
 
 pub const HIGH_WEIGHT: i32 = 1;
+
+// Global concurrent caches for DP optimizations
+static BINARY_CONVERSION_CACHE: OnceLock<DashMap<(u16, usize), Vec<u8>>> = OnceLock::new();
+static COMBINATIONS_CACHE: OnceLock<DashMap<Vec<Vec<u16>>, Vec<Vec<u16>>>> = OnceLock::new();
+static DIMENSIONS_CACHE: OnceLock<DashMap<(String, Option<String>), Vec<MetadataDimensions>>> = OnceLock::new();
+
+/// Initialize global caches
+fn init_caches() {
+    BINARY_CONVERSION_CACHE.get_or_init(|| DashMap::new());
+    COMBINATIONS_CACHE.get_or_init(|| DashMap::new());
+    DIMENSIONS_CACHE.get_or_init(|| DashMap::new());
+}
+
+/// Get the binary conversion cache
+fn get_binary_cache() -> &'static DashMap<(u16, usize), Vec<u8>> {
+    BINARY_CONVERSION_CACHE.get_or_init(|| DashMap::new())
+}
+
+/// Get the combinations cache
+fn get_combinations_cache() -> &'static DashMap<Vec<Vec<u16>>, Vec<Vec<u16>>> {
+    COMBINATIONS_CACHE.get_or_init(|| DashMap::new())
+}
+
+/// Get the dimensions cache
+fn get_dimensions_cache() -> &'static DashMap<(String, Option<String>), Vec<MetadataDimensions>> {
+    DIMENSIONS_CACHE.get_or_init(|| DashMap::new())
+}
+
+/// Clear all global caches (useful for testing or memory management)
+pub fn clear_all_caches() {
+    if let Some(cache) = BINARY_CONVERSION_CACHE.get() {
+        cache.clear();
+    }
+    if let Some(cache) = COMBINATIONS_CACHE.get() {
+        cache.clear();
+    }
+    if let Some(cache) = DIMENSIONS_CACHE.get() {
+        cache.clear();
+    }
+}
+
+/// Get cache statistics for monitoring
+pub fn get_cache_stats() -> (usize, usize, usize) {
+    let binary_size = BINARY_CONVERSION_CACHE.get().map(|c| c.len()).unwrap_or(0);
+    let combinations_size = COMBINATIONS_CACHE.get().map(|c| c.len()).unwrap_or(0);
+    let dimensions_size = DIMENSIONS_CACHE.get().map(|c| c.len()).unwrap_or(0);
+    (binary_size, combinations_size, dimensions_size)
+}
 
 #[derive(Debug, Clone)]
 pub enum Error {
@@ -71,37 +120,37 @@ fn decimal_to_binary_vec(num: u16, size: usize) -> Vec<u8> {
 }
 
 /// Memoized version of decimal_to_binary_vec for better performance
-/// Uses a thread-local cache to avoid recomputing the same conversions
+/// Uses a global concurrent cache to avoid recomputing the same conversions
 pub fn decimal_to_binary_vec_memoized(num: u16, size: usize) -> Vec<u8> {
-    // Use thread-local storage for the cache to avoid synchronization overhead
-    static CACHE: OnceLock<Mutex<HashMap<(u16, usize), Vec<u8>>>> = OnceLock::new();
-    
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = get_binary_cache();
     
     // Check if result is already cached
-    if let Ok(cache_guard) = cache.lock() {
-        if let Some(cached_result) = cache_guard.get(&(num, size)) {
-            return cached_result.clone();
-        }
+    if let Some(cached_result) = cache.get(&(num, size)) {
+        return cached_result.clone();
     }
     
     // Compute the result
     let result = decimal_to_binary_vec(num, size);
     
     // Cache the result
-    if let Ok(mut cache_guard) = cache.lock() {
-        cache_guard.insert((num, size), result.clone());
-    }
+    cache.insert((num, size), result.clone());
     
     result
 }
 
-/// Optimized combination generation using Dynamic Programming
+/// Optimized combination generation using Dynamic Programming with global caching
 /// This version avoids redundant work by building combinations incrementally
-/// and reusing intermediate results
+/// and reusing intermediate results from a global concurrent cache
 pub fn gen_combinations_optimized(vs: &Vec<Vec<u16>>) -> Vec<Vec<u16>> {
     if vs.is_empty() {
         return vec![];
+    }
+    
+    let cache = get_combinations_cache();
+    
+    // Check if result is already cached
+    if let Some(cached_result) = cache.get(vs) {
+        return cached_result.clone();
     }
     
     // Use DP table to store intermediate combinations
@@ -132,8 +181,13 @@ pub fn gen_combinations_optimized(vs: &Vec<Vec<u16>>) -> Vec<Vec<u16>> {
         dp.push(new_combinations);
     }
     
-    // Return the final combinations
-    dp.pop().unwrap_or_default()
+    // Get the final result
+    let result = dp.pop().unwrap_or_default();
+    
+    // Cache the result
+    cache.insert(vs.clone(), result.clone());
+    
+    result
 }
 
 /// Original combination generation function (kept for backward compatibility)
@@ -367,5 +421,37 @@ mod tests {
             (0.0, 0),
         ];
         assert_eq!(expected, lp);
+    }
+
+    #[test]
+    fn test_global_concurrent_cache() {
+        // Clear caches before test
+        clear_all_caches();
+        
+        // Test binary conversion cache
+        let result1 = decimal_to_binary_vec_memoized(5, 4);
+        let result2 = decimal_to_binary_vec_memoized(5, 4);
+        assert_eq!(result1, result2);
+        assert_eq!(result1, vec![0, 1, 0, 1]);
+        
+        // Test combinations cache
+        let input = vec![vec![1, 2], vec![3, 4]];
+        let result1 = gen_combinations_optimized(&input);
+        let result2 = gen_combinations_optimized(&input);
+        assert_eq!(result1, result2);
+        assert_eq!(result1, vec![vec![1, 3], vec![1, 4], vec![2, 3], vec![2, 4]]);
+        
+        // Check cache stats
+        let (binary_size, combinations_size, dimensions_size) = get_cache_stats();
+        assert!(binary_size > 0);
+        assert!(combinations_size > 0);
+        assert_eq!(dimensions_size, 0); // No dimensions cached yet
+        
+        // Clear caches
+        clear_all_caches();
+        let (binary_size, combinations_size, dimensions_size) = get_cache_stats();
+        assert_eq!(binary_size, 0);
+        assert_eq!(combinations_size, 0);
+        assert_eq!(dimensions_size, 0);
     }
 }
