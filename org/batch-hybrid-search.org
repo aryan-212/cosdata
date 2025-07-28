@@ -1,0 +1,206 @@
+# Batch Hybrid Search API
+
+## Overview
+
+The batch hybrid search API endpoint allows performing multiple hybrid searches in a single request, combining different search strategies (dense/sparse/TF-IDF) for improved efficiency and performance.
+
+## API Endpoint
+
+**POST** `/api/v1/collections/{collection_id}/search/batch-hybrid`
+
+## Request Body
+
+```json
+{
+  "queries": [
+    {
+      "query_vector": [0.1, 0.2, 0.3, ...],
+      "query_terms": [{"index": 0, "value": 0.5}, {"index": 1, "value": 0.8}],
+      "sparse_early_terminate_threshold": 0.1
+    },
+    {
+      "query_vector": [0.4, 0.5, 0.6, ...],
+      "query_text": "sample text content for TF-IDF search"
+    },
+    {
+      "query_terms": [{"index": 2, "value": 0.3}, {"index": 3, "value": 0.7}],
+      "query_text": "another text query for hybrid search",
+      "sparse_early_terminate_threshold": 0.2
+    }
+  ],
+  "top_k": 10,
+  "fusion_constant_k": 60.0,
+  "return_raw_text": true
+}
+```
+
+## Query Types
+
+The batch hybrid search supports three types of hybrid queries:
+
+### 1. DenseAndSparse
+Combines dense vector similarity with sparse vector search:
+```json
+{
+  "query_vector": [0.1, 0.2, 0.3, ...],
+  "query_terms": [{"index": 0, "value": 0.5}, {"index": 1, "value": 0.8}],
+  "sparse_early_terminate_threshold": 0.1
+}
+```
+
+### 2. DenseAndTFIDF
+Combines dense vector similarity with TF-IDF text search:
+```json
+{
+  "query_vector": [0.1, 0.2, 0.3, ...],
+  "query_text": "sample text content for TF-IDF search"
+}
+```
+
+### 3. SparseAndTFIDF
+Combines sparse vector search with TF-IDF text search:
+```json
+{
+  "query_terms": [{"index": 0, "value": 0.5}, {"index": 1, "value": 0.8}],
+  "query_text": "sample text content for TF-IDF search",
+  "sparse_early_terminate_threshold": 0.1
+}
+```
+
+## Parameters
+
+- **queries**: Array of hybrid search queries (required)
+- **top_k**: Number of results to return per query (default: 10)
+- **fusion_constant_k**: Reciprocal Rank Fusion constant (default: 60.0)
+- **return_raw_text**: Whether to return raw text in results (default: false)
+
+## Response
+
+```json
+{
+  "responses": [
+    {
+      "results": [
+        {
+          "id": "vec_123",
+          "document_id": "doc_456",
+          "score": 0.85,
+          "text": "sample text content"
+        }
+      ],
+      "warning": null
+    },
+    {
+      "results": [
+        {
+          "id": "vec_789",
+          "document_id": "doc_012",
+          "score": 0.92,
+          "text": "another text content"
+        }
+      ],
+      "warning": null
+    }
+  ],
+  "warning": "Embeddings are currently being indexed; some results may be temporarily unavailable."
+}
+```
+
+## Benefits
+
+1. **Performance**: Multiple hybrid searches in a single request reduce network overhead
+2. **Efficiency**: Batch processing allows for optimized internal operations
+3. **Consistency**: All queries in a batch use the same parameters (top_k, fusion_constant_k)
+4. **Flexibility**: Support for different hybrid search combinations in a single batch
+
+## Usage Examples
+
+### Python Client
+
+```python
+# Batch hybrid search with different query types
+results = collection.search.batch_hybrid(
+    queries=[
+        {
+            "query_vector": [0.1, 0.2, 0.3, ...],
+            "query_terms": [{"index": 0, "value": 0.5}],
+            "sparse_early_terminate_threshold": 0.1
+        },
+        {
+            "query_vector": [0.4, 0.5, 0.6, ...],
+            "query_text": "search text"
+        },
+        {
+            "query_terms": [{"index": 1, "value": 0.8}],
+            "query_text": "another search",
+            "sparse_early_terminate_threshold": 0.2
+        }
+    ],
+    top_k=10,
+    fusion_constant_k=60.0,
+    return_raw_text=True
+)
+
+for i, response in enumerate(results['responses']):
+    print(f"Query {i+1}: {len(response['results'])} results")
+```
+
+### cURL Example
+
+```bash
+curl -X POST "http://localhost:8080/api/v1/collections/my_collection/search/batch-hybrid" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queries": [
+      {
+        "query_vector": [0.1, 0.2, 0.3],
+        "query_terms": [{"index": 0, "value": 0.5}]
+      },
+      {
+        "query_vector": [0.4, 0.5, 0.6],
+        "query_text": "search text"
+      }
+    ],
+    "top_k": 10,
+    "fusion_constant_k": 60.0
+  }'
+```
+
+## Implementation Details
+
+The batch hybrid search implementation:
+
+1. **Validates** each query in the batch
+2. **Performs** individual hybrid searches for each query
+3. **Applies** Reciprocal Rank Fusion (RRF) to combine results
+4. **Returns** a batch response with results for each query
+
+The fusion algorithm uses the formula:
+```
+score = 1 / (rank + k + ε)
+```
+
+Where:
+- `rank` is the position in the result list
+- `k` is the fusion_constant_k parameter
+- `ε` is a small constant to avoid division by zero
+
+## Error Handling
+
+- **400 Bad Request**: Invalid query format or parameters
+- **404 Not Found**: Collection not found
+- **500 Internal Server Error**: Index not available or other server errors
+
+## Performance Considerations
+
+- Batch size should be reasonable (typically 10-100 queries)
+- Larger batches may have higher latency but better throughput
+- Consider the available memory and CPU resources
+- Monitor response times for optimal batch sizes
+
+## Related Endpoints
+
+- `POST /collections/{collection_id}/search/hybrid` - Single hybrid search
+- `POST /collections/{collection_id}/search/batch-dense` - Batch dense search
+- `POST /collections/{collection_id}/search/batch-sparse` - Batch sparse search
+- `POST /collections/{collection_id}/search/batch-tf-idf` - Batch TF-IDF search 
